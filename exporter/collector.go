@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"time"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -62,7 +63,7 @@ func (mc JSONMetricCollector) Collect(ch chan<- prometheus.Metric) {
 					m.Desc,
 					m.ValueType,
 					floatValue,
-					extractLabels(mc.Logger, mc.Data, m.LabelsJSONPaths)...,
+					extractLabels(mc.Logger, mc.Data, "", m.LabelsJSONPaths)...,
 				)
 				ch <- timestampMetric(mc.Logger, m, mc.Data, metric)
 			} else {
@@ -85,23 +86,43 @@ func (mc JSONMetricCollector) Collect(ch chan<- prometheus.Metric) {
 						level.Error(mc.Logger).Log("msg", "Failed to marshal data to json", "path", m.ValueJSONPath, "err", err, "metric", m.Desc, "data", data)
 						continue
 					}
-					value, err := extractValue(mc.Logger, jdata, m.ValueJSONPath, false)
+					var rootKey, valuePath string
+					c := make(map[string]json.RawMessage)
+					err = json.Unmarshal(jdata, &c)
 					if err != nil {
-						level.Error(mc.Logger).Log("msg", "Failed to extract value for metric", "path", m.ValueJSONPath, "err", err, "metric", m.Desc)
-						continue
+						panic(err)
 					}
+					for key, _ := range c {
+						if strings.Index(m.ValueJSONPath, "@") > 0 {
+							//dynamically prepend root key to json path
+							//in cases where it cannot be determined ahead of time
+							rootKey = key
+							valuePath = strings.Replace(m.ValueJSONPath, "@", rootKey, 1)
+						} else {
+							valuePath = m.ValueJSONPath
+						}
+						value, err := extractValue(mc.Logger, jdata, valuePath, false)
+						if err != nil {
+							level.Error(mc.Logger).Log("msg", "Failed to extract value for metric", "path", valuePath, "err", err, "metric", m.Desc)
+							continue
+						}
 
-					if floatValue, err := SanitizeValue(value); err == nil {
-						metric := prometheus.MustNewConstMetric(
-							m.Desc,
-							m.ValueType,
-							floatValue,
-							extractLabels(mc.Logger, jdata, m.LabelsJSONPaths)...,
-						)
-						ch <- timestampMetric(mc.Logger, m, jdata, metric)
-					} else {
-						level.Error(mc.Logger).Log("msg", "Failed to convert extracted value to float64", "path", m.ValueJSONPath, "value", value, "err", err, "metric", m.Desc)
-						continue
+						if floatValue, err := SanitizeValue(value); err == nil {
+							metric := prometheus.MustNewConstMetric(
+								m.Desc,
+								m.ValueType,
+								floatValue,
+								extractLabels(mc.Logger, jdata, rootKey, m.LabelsJSONPaths)...,
+							)
+							ch <- timestampMetric(mc.Logger, m, jdata, metric)
+						} else {
+							level.Error(mc.Logger).Log("msg", "Failed to convert extracted value to float64", "path", valuePath, "value", value, "err", err, "metric", m.Desc)
+							continue
+						}
+						//process once if this is for a definitive json path
+						if strings.Index(m.ValueJSONPath, "@") < 1 && len(c) > 1 {
+							break
+						}
 					}
 				}
 			} else {
@@ -149,13 +170,14 @@ func extractValue(logger log.Logger, data []byte, path string, enableJSONOutput 
 }
 
 // Returns the list of labels created from the list of provided json paths
-func extractLabels(logger log.Logger, data []byte, paths []string) []string {
+func extractLabels(logger log.Logger, data []byte, rootKey string, paths []string) []string {
 	labels := make([]string, len(paths))
 	for i, path := range paths {
-		if result, err := extractValue(logger, data, path, false); err == nil {
+		labelPath := strings.Replace(path, "@", rootKey, 1)
+		if result, err := extractValue(logger, data, labelPath, false); err == nil {
 			labels[i] = result
 		} else {
-			level.Error(logger).Log("msg", "Failed to extract label value", "err", err, "path", path, "data", data)
+			level.Error(logger).Log("msg", "Failed to extract label value", "err", err, "path", labelPath, "data", data)
 		}
 	}
 	return labels
